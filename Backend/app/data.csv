@@ -1,0 +1,122 @@
+text,label
+"I finished the user authentication feature.",0
+"Completed the API integration yesterday.",0
+"Worked on the database schema design.",0
+"Fixed the bug in the login flow.",0
+"Completed the frontend layout for the dashboard.",0
+"Did code review for the payment module.",0
+"Wrote unit tests for the new components.",0
+"Resolved the issue with the server timeout.",0
+"Updated the documentation for the project.",0
+"Completed deployment to the staging environment.",0
+"What did I do in yesterday's standup?",1
+"Show me my tasks from last week.",1
+"Did I report any blockers yesterday?",1
+"What was my update in the last meeting?",1
+"Tell me about my progress from yesterday.",1
+"Do I have any pending tasks?",1
+"What are my completed tasks so far?",1
+"Did I mention any bugs in the last update?",1
+"Can you show my last standup report?",1
+"What updates did I share yesterday?",1
+"Update my task to include testing the API.",2
+"Change my yesterday’s update to completed the bug fix.",2
+"Modify my reported blocker to network issues.",2
+"Correct the status of the login feature to done.",2
+"Edit my standup note to add code review.",2
+"Adjust my task update to include database optimization.",2
+"Change the sprint goal to improve performance.",2
+"Update the progress to 80% complete.",2
+"Modify my last entry to include frontend bug fix.",2
+"Correct my update about deployment to production.",2
+"Hello team!",3
+"Good morning!",3
+"How’s the weather today?",3
+"Can you tell me a joke?",3
+"What’s the office Wi-Fi password?",3
+"Who is on call today?",3
+"Thanks for the help!",3
+"Bye for now!",3
+"Can you play some music?",3
+"What time is the next meeting?",3
+"Today I completed the frontend login feature.",0
+"I finished the authentication module.",0
+"Worked on fixing the signup bug.",0
+"Completed API integration.",0
+"I fixed the broken links on the homepage.",0
+"Refactored the dashboard UI.",0
+"Worked on error handling for the forms.",0
+"Did testing for the profile page.",0
+"Created unit tests for user service.",0
+"Updated styles for the mobile layout.",0
+"Deployed to staging environment.",0
+"Finalized sprint tasks.",0
+"Did code review for team member's PR.",0
+"Cleaned up unused assets.",0
+"I worked on task A.",0
+"Today I did task B.",0
+"Completed the onboarding flow.",0
+"Fixed logout issue.",0
+"Reviewed merge conflicts.",0
+"Added documentation for API usage.",0
+"What did I do yesterday?",1
+"Show me my last standup update.",1
+"Did I log any blockers this week?",1
+"What are my completed tasks?",1
+"Can I view yesterday's updates?",1
+"Which tasks did I work on last sprint?",1
+"Tell me what I did last Monday.",1
+"What was my last update?",1
+"Did I finish task A?",1
+"What progress have I made this week?",1
+"Show my previous standup entry.",1
+"List my updates from yesterday.",1
+"What was my report on Friday?",1
+"Tell me my last status update.",1
+"Was task B completed?",1
+"What is my current status?",1
+"Did I submit the deployment update?",1
+"What updates did I provide last meeting?",1
+"Have I logged any new updates?",1
+"Can I check my past entries?",1
+"Update my last entry to include bug fix.",2
+"Change my update to completed task A.",2
+"Edit the status of login page to done.",2
+"Modify my previous update to include testing.",2
+"Add deployment details to yesterday’s update.",2
+"Correct my status for signup page.",2
+"Replace last update with completed API setup.",2
+"Update the report to remove blocker.",2
+"Fix my update from Monday to include code review.",2
+"Adjust the logged hours for today.",2
+"Edit my standup note to reflect backend work.",2
+"Change yesterday’s update to show completed task B.",2
+"Add code coverage result to update.",2
+"Update my report to include database changes.",2
+"Include mobile fix in my last log.",2
+"Fix typo in last update.",2
+"Add new task to my status.",2
+"Update the blocker from UI bug to server crash.",2
+"Modify progress to 90% done.",2
+"Change task owner to myself.",2
+"Hello!",3
+"Good morning!",3
+"How's it going?",3
+"What's the weather today?",3
+"Tell me a joke.",3
+"Play some music.",3
+"Who won the match last night?",3
+"What's the time?",3
+"Any movie suggestions?",3
+"I'm bored.",3
+"Nice work!",3
+"Bye!",3
+"Good job team!",3
+"Thanks!",3
+"Happy Friday!",3
+"Any good lunch ideas?",3
+"Cool!",3
+"Yay!",3
+"What's up?",3
+"I'm just checking in.",3
+
