@@ -1,33 +1,52 @@
+import os
+import re
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # FORCE CPU
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from pymongo import MongoClient
+from bson import ObjectId
+from datetime import datetime, date
+import json
+from dotenv import load_dotenv
+
+import spacy
+from sentence_transformers import SentenceTransformer, util
+
 from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 from langchain_core.prompts import PromptTemplate
-from langchain.output_parsers import PydanticOutputParser
-from pydantic import BaseModel
-from typing import List
-import psycopg2, json, re, os
-from dotenv import load_dotenv
-from datetime import date
-from psycopg2.extras import RealDictCursor
 
 # ----------------------------------------------------
-#  Flask + Database Setup
+# App Setup
 # ----------------------------------------------------
 app = Flask(__name__)
-load_dotenv()
 CORS(app)
-
-def get_connection():
-    return psycopg2.connect(
-        dbname="scrumbotdb",
-        user="postgres",
-        password="123456",  # change if needed
-        host="localhost",
-        port="5432"
-    )
+load_dotenv()
 
 # ----------------------------------------------------
-#  LLM Setup
+# MongoDB Setup (SINGLE SOURCE)
+# ----------------------------------------------------
+client = MongoClient("mongodb://localhost:27017")
+db = client["scrumbotdb"]
+
+developers_col = db["developers"]
+projects_col = db["projects"]
+sprints_col = db["sprints"]
+stories_col = db["user_stories"]
+tasks_col = db["tasks"]
+subtasks_col = db["subtasks"]
+standups_col = db["standups"]
+blockers_col = db["blockers"]
+reports_col = db["reports"]
+
+# ----------------------------------------------------
+# NLP MODELS
+# ----------------------------------------------------
+nlp = spacy.load("en_core_web_sm")
+embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+
+# ----------------------------------------------------
+# LLM Setup
 # ----------------------------------------------------
 llm = HuggingFaceEndpoint(
     repo_id="meta-llama/Llama-3.1-8B-Instruct",
@@ -36,143 +55,311 @@ llm = HuggingFaceEndpoint(
 model = ChatHuggingFace(llm=llm)
 
 # ----------------------------------------------------
-#  1. Sprint Generation
+# NLP HELPERS (UNCHANGED LOGIC)
 # ----------------------------------------------------
-class SubTask(BaseModel):
-    subtask_id: int
-    title: str
-    description: str
+def detect_status(text):
+    t = text.lower()
+    if any(w in t for w in ["done", "completed", "finished"]):
+        return "Done"
+    if any(w in t for w in ["blocked", "stuck", "issue", "error"]):
+        return "Blocked"
+    return "In Progress"
 
-class Task(BaseModel):
-    task_id: int
-    title: str
-    description: str
-    subtasks: List[SubTask] = []
 
-class Sprint(BaseModel):
-    sprint_id: int
-    sprint_name: str
-    goal: str
-    tasks: List[Task]
+def extract_percent(text):
+    t = text.lower()
+    if "half" in t:
+        return 50
+    if "almost" in t:
+        return 80
+    if any(w in t for w in ["done", "completed", "finished"]):
+        return 100
+    return None
 
-parser = PydanticOutputParser(pydantic_object=Sprint)
 
-sprint_prompt = PromptTemplate(
-    input_variables=["project_name", "project_description"],
-    partial_variables={
-        "format_instructions": """
-Expected JSON:
-{
-  "sprint_id": 1,
-  "sprint_name": "Sprint Name",
-  "goal": "Sprint Goal",
-  "tasks": [
-    {
-      "task_id": 1,
-      "title": "Task Title",
-      "description": "Task Description",
-      "subtasks": [
-        {"subtask_id": 101, "title": "Subtask Title", "description": "Subtask Description"}
-      ]
+def clean_blocker_reason(text):
+    text = re.sub(r"(done|completed|finished)[^,]*,?", "", text, flags=re.I)
+    return text.strip().capitalize()
+
+
+def match_subtask(sentence):
+    subtasks = list(subtasks_col.find({}))
+    if not subtasks:
+        return None, 0.0
+
+    titles = [s["title"] for s in subtasks]
+
+    sent_emb = embedder.encode(sentence, convert_to_tensor=True)
+    task_emb = embedder.encode(titles, convert_to_tensor=True)
+
+    scores = util.cos_sim(sent_emb, task_emb)[0]
+    best_idx = scores.argmax().item()
+
+    return subtasks[best_idx], float(scores[best_idx])
+
+
+def parse_sentence(sentence):
+    subtask, score = match_subtask(sentence)
+
+    if not subtask or score < 0.40:
+        return None
+
+    task = tasks_col.find_one({"_id": subtask["task_id"]})
+
+    return {
+        "subtask_id": str(subtask["_id"]),
+        "subtask_title": subtask["title"],
+        "task_title": task["title"] if task else None,
+        "status": detect_status(sentence),
+        "percent_complete": extract_percent(sentence),
+        "raw_sentence": sentence,
+        "confidence": round(score, 2)
     }
-  ]
-}
-"""
-    },
-    template="""
-You are an expert Agile Project Planner AI.
-Generate a sprint plan for the following project:
 
-Project: {project_name}
-Description: {project_description}
+# ----------------------------------------------------
+# NLP CHAT ENDPOINT (FLASK VERSION)
+# ----------------------------------------------------
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    developer_id = data["developer_id"]
+    message = data["message"]
+
+    sentences = [s.strip() for s in re.split(r"[.,]", message) if s.strip()]
+
+    updates = []
+    replies = []
+
+    for s in sentences:
+        parsed = parse_sentence(s)
+        if not parsed:
+            continue
+
+        update_fields = {"status": parsed["status"]}
+        if parsed["percent_complete"] is not None:
+            update_fields["percent_complete"] = parsed["percent_complete"]
+
+        subtasks_col.update_one(
+            {"_id": ObjectId(parsed["subtask_id"])},
+            {"$set": update_fields}
+        )
+
+        if parsed["status"] == "Blocked":
+            blockers_col.insert_one({
+                "subtask_id": ObjectId(parsed["subtask_id"]),
+                "reason": clean_blocker_reason(s),
+                "reported_by": developer_id,
+                "created_at": datetime.utcnow()
+            })
+
+        updates.append(parsed)
+        replies.append(
+            f"{'⚠️' if parsed['status']=='Blocked' else '✅'} "
+            f"{parsed['subtask_title']} → {parsed['status']}"
+        )
+
+    standups_col.insert_one({
+        "developer_id": developer_id,
+        "message": message,
+        "updates": updates,
+        "created_at": datetime.utcnow()
+    })
+
+    if not replies:
+        return jsonify({"reply": "❓ I couldn’t confidently match any task."})
+
+    return jsonify({
+        "reply": "\n".join(replies),
+        "updates": updates
+    })
+# ----------------------------------------------------
+# Sprint Planning Prompt
+# ----------------------------------------------------
+sprint_prompt = PromptTemplate(
+    input_variables=["stories", "team_size", "sprint_days"],
+    template="""
+You are an Agile Scrum Planning AI.
+
+Context:
+- Team size: {team_size} developers
+- Sprint length: {sprint_days} working days
+- First sprint (no historical velocity)
+
+User Stories:
+{stories}
 
 Rules:
-1. Maintain JSON hierarchy: Sprint → Tasks → Subtasks.
-2. Generate unique task_id and subtask_id values.
-3. Output only the JSON object — no markdown.
+1. Pick only stories that realistically fit the sprint.
+2. Create a clear Sprint Goal.
+3. Break each story into Tasks.
+4. Each task must have Subtasks.
+5. Subtasks must be small (4–8 hours).
+6. Output ONLY valid JSON.
 
-{format_instructions}
+JSON format:
+{{
+  "sprint_name": "Sprint Name",
+  "sprint_goal": "Goal",
+  "stories": [
+    {{
+      "story_id": "US1",
+      "title": "Story title",
+      "tasks": [
+        {{
+          "title": "Task title",
+          "description": "Task description",
+          "subtasks": [
+            {{
+              "title": "Subtask title",
+              "description": "Subtask description",
+              "estimated_hours": 6
+            }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
 """
 )
 
-def extract_json(text):
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    return match.group(1) if match else text.strip()
 
+def clean_json(text):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    return json.loads(match.group()) if match else {}
+
+# ----------------------------------------------------
+# 1️⃣ Generate Sprint
+# ----------------------------------------------------
 @app.route("/generate_sprint", methods=["POST"])
 def generate_sprint():
     try:
         payload = request.json
-        project_name = payload.get("project_name")
-        project_description = payload.get("project_description")
 
-        if not project_name or not project_description:
-            return jsonify({"error": "Missing project_name or project_description"}), 400
+        project_id = payload["project_id"]
+        sprint_name = payload["sprint_name"]
+        sprint_days = payload["sprint_length_days"]
+        team_size = payload["team_size"]
+        user_stories = payload["user_stories"]
 
         prompt = sprint_prompt.invoke({
-            "project_name": project_name,
-            "project_description": project_description
+            "stories": json.dumps(user_stories),
+            "team_size": team_size,
+            "sprint_days": sprint_days
         })
 
         response = model.invoke(prompt)
-        raw_output = extract_json(response.content)
-        parsed_sprint = parser.parse(raw_output)
+        sprint_data = clean_json(response.content)
 
-        conn = get_connection()
-        cursor = conn.cursor()
+        # Insert Sprint
+        sprint_doc = {
+            "name": sprint_data["sprint_name"],
+            "goal": sprint_data["sprint_goal"],
+            "project_id": project_id,
+            "start_date": date.today().isoformat(),
+            "end_date": date.today().isoformat(),
+            "status": "Planned",
+            "created_at": datetime.utcnow()
+        }
 
-        # Insert sprint
-        cursor.execute("""
-            INSERT INTO sprints (name, goal, start_date, end_date, project_id, progress)
-            VALUES (%s, %s, %s, %s, %s, 0) RETURNING sprint_id
-        """, (parsed_sprint.sprint_name, parsed_sprint.goal, date.today(), date.today(), 1))
-        sprint_id = cursor.fetchone()[0]
-        conn.commit()
+        sprint_id = sprints_col.insert_one(sprint_doc).inserted_id
 
-        # Insert tasks and subtasks
-        for task in parsed_sprint.tasks:
-            cursor.execute("""
-                INSERT INTO tasks (title, description, sprint_id, status, progress)
-                VALUES (%s, %s, %s, 'incomplete', 0) RETURNING task_id
-            """, (task.title, task.description, sprint_id))
-            task_id = cursor.fetchone()[0]
-            conn.commit()
+        # Insert Stories, Tasks, Subtasks
+        for story in sprint_data["stories"]:
+            story_doc = {
+                "story_code": story["story_id"],
+                "title": story["title"],
+                "sprint_id": sprint_id,
+                "status": "To Do",
+                "created_at": datetime.utcnow()
+            }
+            story_id = stories_col.insert_one(story_doc).inserted_id
 
-            for sub in task.subtasks:
-                cursor.execute("""
-                    INSERT INTO tasks (title, description, sprint_id, parent_task_id, status, progress)
-                    VALUES (%s, %s, %s, %s, 'incomplete', 0)
-                """, (sub.title, sub.description, sprint_id, task_id))
-                conn.commit()
+            for task in story["tasks"]:
+                task_doc = {
+                    "title": task["title"],
+                    "description": task["description"],
+                    "story_id": story_id,
+                    "sprint_id": sprint_id,
+                    "status": "To Do",
+                    "created_at": datetime.utcnow()
+                }
+                task_id = tasks_col.insert_one(task_doc).inserted_id
 
-        cursor.close()
-        conn.close()
+                for sub in task["subtasks"]:
+                    subtasks_col.insert_one({
+                        "title": sub["title"],
+                        "description": sub["description"],
+                        "task_id": task_id,
+                        "status": "To Do",
+                        "estimated_hours": sub["estimated_hours"],
+                        "actual_hours": 0,
+                        "created_at": datetime.utcnow()
+                    })
 
         return jsonify({
             "message": "Sprint generated successfully",
-            "sprint_id": sprint_id,
-            "sprint_details": parsed_sprint.model_dump()
+            "sprint_id": str(sprint_id),
+            "goal": sprint_data["sprint_goal"]
         }), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ----------------------------------------------------
+# 2️⃣ Standup Submission (NLP Ready)
+# ----------------------------------------------------
+@app.route("/submit_standup", methods=["POST"])
+def submit_standup():
+    try:
+        data = request.json
+
+        standups_col.insert_one({
+            "dev_id": data["dev_id"],
+            "sprint_id": ObjectId(data["sprint_id"]),
+            "date": date.today().isoformat(),
+            "yesterday": data.get("yesterday", []),
+            "today": data.get("today", []),
+            "blockers": data.get("blockers", []),
+            "raw_text": data.get("raw_text"),
+            "created_at": datetime.utcnow()
+        })
+
+        # Auto-create blockers
+        for b in data.get("blockers", []):
+            blockers_col.insert_one({
+                "subtask_id": b["subtask_id"],
+                "dev_id": data["dev_id"],
+                "sprint_id": ObjectId(data["sprint_id"]),
+                "description": b["issue"],
+                "status": "Open",
+                "reported_at": datetime.utcnow()
+            })
+
+        return jsonify({"message": "Standup recorded"}), 201
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ----------------------------------------------------
-#  2. Report Generation
+# 3️⃣ Generate Reports
 # ----------------------------------------------------
 report_prompt = PromptTemplate(
-    input_variables=["type_of_report", "data"],
+    input_variables=["type", "data"],
     template="""
-You are an AI report generator.
-Generate a professional report for {type_of_report} data below:
+You are an AI Scrum Report Generator.
+
+Generate a professional report for {type}:
 
 {data}
 
-Rules:
-1. Include Title, Summary, Observations, and Recommendations.
-2. Use a professional, factual tone.
-3. Output plain text only (no markdown).
+Include:
+- Summary
+- Observations
+- Risks
+- Recommendations
+
+Plain text only.
 """
 )
 
@@ -180,145 +367,53 @@ Rules:
 def generate_report():
     try:
         payload = request.json
-        report_type = payload.get("type")
-        report_id = payload.get("id")
-
-        if report_type not in ["sprint", "standup", "employee"]:
-            return jsonify({"error": "Invalid report type"}), 400
-
-        conn = get_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        report_type = payload["type"]
+        ref_id = payload["id"]
 
         if report_type == "sprint":
-            cursor.execute("SELECT * FROM sprints WHERE sprint_id = %s", (report_id,))
+            data = sprints_col.find_one({"_id": ObjectId(ref_id)})
         elif report_type == "standup":
-            cursor.execute("SELECT * FROM standups WHERE standup_id = %s", (report_id,))
+            data = standups_col.find_one({"_id": ObjectId(ref_id)})
         else:
-            cursor.execute("SELECT * FROM tasks WHERE employee_id = %s", (report_id,))
-
-        rows = cursor.fetchall()
-        if not rows:
-            return jsonify({"error": f"No data found for {report_type} ID {report_id}"}), 404
+            return jsonify({"error": "Invalid report type"}), 400
 
         prompt = report_prompt.invoke({
-            "type_of_report": report_type,
-            "data": json.dumps(rows, default=str)
+            "type": report_type,
+            "data": json.dumps(data, default=str)
         })
 
         response = model.invoke(prompt)
-        report_text = response.content.strip()
 
-        cursor.execute("""
-            INSERT INTO reports (date, content, project_id)
-            VALUES (%s, %s, 1)
-        """, (date.today(), report_text))
-        conn.commit()
+        reports_col.insert_one({
+            "type": report_type,
+            "content": response.content,
+            "created_at": datetime.utcnow()
+        })
 
-        cursor.close()
-        conn.close()
-
-        return jsonify({"message": "Report generated successfully", "report": report_text}), 201
+        return jsonify({"report": response.content}), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ----------------------------------------------------
-#  3. Dashboards (Database-driven)
+# 4️⃣ Dashboards
 # ----------------------------------------------------
-@app.route('/get_sprints', methods=['GET'])
+@app.route("/get_sprints", methods=["GET"])
 def get_sprints():
-    try:
-        conn = get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT s.sprint_id, s.name AS sprint_name, s.progress, s.goal, 
-                   p.name AS project_name, s.start_date, s.end_date
-            FROM sprints s
-            JOIN projects p ON s.project_id = p.project_id
-            ORDER BY s.sprint_id DESC;
-        """)
-        data = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"sprints": data}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    sprints = list(sprints_col.find({}, {"_id": 1, "name": 1, "goal": 1, "status": 1}))
+    for s in sprints:
+        s["_id"] = str(s["_id"])
+    return jsonify({"sprints": sprints})
 
-
-@app.route('/get_reports', methods=['GET'])
-def get_reports():
-    try:
-        conn = get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT r.report_id, r.date, r.content, p.name AS project_name
-            FROM reports r
-            JOIN projects p ON r.project_id = p.project_id
-            ORDER BY r.date DESC;
-        """)
-        data = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"reports": data}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/get_employees', methods=['GET'])
-def get_employees():
-    try:
-        conn = get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT e.employee_id, e.name, e.role, p.name AS project_name,
-                   COUNT(t.task_id) FILTER (WHERE t.status IN ('complete', 'completed')) AS completed_tasks,
-                   COUNT(t.task_id) AS total_tasks
-            FROM employees e
-            LEFT JOIN projects p ON e.project_id = p.project_id
-            LEFT JOIN tasks t ON e.employee_id = t.employee_id
-            GROUP BY e.employee_id, e.name, e.role, p.name
-            ORDER BY e.employee_id;
-        """)
-        data = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"employees": data}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/get_projects', methods=['GET'])
+@app.route("/get_projects", methods=["GET"])
 def get_projects():
-    try:
-        conn = get_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT p.project_id, p.name AS project_name, sm.name AS scrum_master,
-                   COUNT(s.sprint_id) AS sprint_count,
-                   ROUND(AVG(s.progress), 2) AS avg_progress
-            FROM projects p
-            LEFT JOIN scrum_masters sm ON p.scrum_master_id = sm.id
-            LEFT JOIN sprints s ON s.project_id = p.project_id
-            GROUP BY p.project_id, p.name, sm.name;
-        """)
-        projects = cur.fetchall()
-
-        # Fetch team members for each project
-        for project in projects:
-            cur.execute("SELECT e.name FROM employees e WHERE e.project_id = %s", (project['project_id'],))
-            team = [r['name'] for r in cur.fetchall()]
-            project['team'] = team
-
-        cur.close()
-        conn.close()
-        return jsonify({"projects": projects}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+    projects = list(projects_col.find())
+    for p in projects:
+        p["_id"] = str(p["_id"])
+    return jsonify({"projects": projects})
 
 # ----------------------------------------------------
-#  Run the app
+# Run App
 # ----------------------------------------------------
 if __name__ == "__main__":
     app.run(debug=True)
